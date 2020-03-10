@@ -2,19 +2,20 @@
 #include <Wire.h> //for RTC comms over I2C
 #include <SPI.h>  //for LED output to Max7219 module
 
-//THIS VERSION FOR ARDUINO NANO OR UNO
-// Commit Date: March 4, 2020
+//VERSION 5: PORTING OVER TO THE NANO WITH NEW PIN ASSIGNMENTS.
+// Commit Date: March 10, 2020
+// RTC always has UTC time and date
 
-//Nano pins: D10-D13, SPI for Max 7219 8 digit 7 seg LED module;  A4(SDA) and A5(SCL) for I2C to DS3231 RTC; D0-D1 for serial.
+//Nano pins: D10-D13, SPI for Max;  A4(SDA) and A5(SCL) for I2C to DS3231 RTC; D0-D1 for serial.
 //           D2 for IR receiver interrupt. D4 for RTC-SQW. D5 for GPS-PPS.
 
 //STATE MACHINE SETUP//
   enum { DEBUG, BOOTUP, REG_OPS, TOGGLE_DISPLAY, GPS_INIT, GPS_PPS_SYNC, GPS_NMEA_SYNC} StateMachine;
 
 //PIN DEFS & ADDRESSES//
-  const byte RTC_SQW_Pin = 4; 
-  const byte GPS_PPS_Pin = 5;
-  const byte ir_pin = 2;    //Interrupt pin for IR receiver data pin.
+  const byte RTC_SQW_Pin = 17;  //same as A3 pin (using analog pin as digital)
+  const byte GPS_PPS_Pin = 2;
+  const byte ir_pin = 3;    //Interrupt pin for IR receiver data pin.
   const byte ChipSelectPin = 10;  // For Max7219. We set the SPI Chip Select/Slave Select Pin here. 10 for uno/nano. 53 for mega
   
   const int RTC_I2C_ADDRESS = 0x68;  // Must be type [int] to keep wire.h happy. Sets RTC DS3231 RTC i2C address. 
@@ -29,7 +30,7 @@
   byte GPS_PPS_Prev = HIGH;
 
 //ISR HANDLERS//
-  volatile unsigned int pulseChangeTime;  
+  volatile unsigned int pulseChangeTime;  //long or int?
   volatile byte pulseFlag = 0;
 
 
@@ -47,6 +48,8 @@
  
   const byte days[] = {0,31,28,31,30,31,30,31,31,30,31,30,31}; // mapping days of the month
 
+  const int currentCentury = 2000;
+  
   /* globals that store our offset*/
   int  offYYYY;
   byte offMO;
@@ -60,7 +63,7 @@
 
 //GPS UTC date+time handlers//
   byte hhGPS, mmGPS, ssGPS, ddGPS, moGPS;
-  int yyyyGPS; 
+  int yyyyGPS = 0; 
   
   bool newGPS_dateAvail = false;
   bool newGPS_timeAvail = false;
@@ -474,7 +477,7 @@ void offsetAdj(int y, byte mo, byte d, byte h, byte m, char offsetHr, char offse
   offMO = mo;
   if (offsetHr + h < 0) {
      //Do a decrement
-     if (d>1) {
+     if (d > 1) {
       offDD--;
      }
      else { //rollover
@@ -532,8 +535,17 @@ byte dow(int y, byte m, byte d) { //pass non-leading zero values
 } //end of dow()
   
 void getLocalTime(int y, byte mo, byte d, byte h, byte m) {
-  // **this function sets offMO,offDD, offYY, offHH, offMM to local time**
+  // **this function sets offMO, offDD, offYYYY, offHH, offMM to local time**
   // we first get a baseline offset
+  // NOTE: int y is being passed as RTC's 2-digit date.
+  
+  if (yyyyGPS == 0) {   // Converting RTC 2 digit date to 4 digit:
+    y += currentCentury;  // takes our 2-digit year and converts to 4 digit
+  }
+  else { // or if GPS signal available, we just use that
+    y = yyyyGPS; // uses GPS 4-digit year if available
+  }
+  
   offsetAdj(y,mo,d,h,m,offsetStandardHr,offsetStandardMin);
 
   // next we do our DST checks, and recalc offset if DST is in effect
@@ -591,9 +603,15 @@ bool RTC_detect() { //Detects DS3231 SQW falling edge
   return (RTC_SQW_Prev == HIGH && RTC_SQW_Current == LOW);
 } //end of detect_RTC
 
-void displayRTCDate() {
-  getRTC();
-  displayRTC_timeOnMax(ddRTC,moRTC,yyRTC);
+void displayRTCDate() {   // adjusts to local date if flag set
+  getRTC(); // updates ssRTC, mmRTC, hhRTC, dowRTC, ddRTC, moRTC, ctyRTC, yyRTC;
+  if (UTC_offset_enable == false) {  // if flag false, we do UTC time and date
+    displayRTC_timeOnMax(ddRTC,moRTC,yyRTC);  // displays UTC date
+  } //end if
+  else {                             // else requests local offset time
+    getLocalTime(yyRTC,moRTC,ddRTC,hhRTC,mmRTC); // updates offDD,offMO,offYYYY
+    displayRTC_timeOnMax(offDD,offMO,offYYYY % 100);
+  }
 } //end displayRTCDate
 
 void displayRTC() { //updates display if new RTC time. Detects DS3231 SQW falling edge then trigger display of time update
