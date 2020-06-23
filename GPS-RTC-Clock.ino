@@ -2,23 +2,23 @@
 #include <Wire.h> //for RTC comms over I2C
 #include <SPI.h>  //for LED output to Max7219 module
 
-//VERSION 5: PORTING OVER TO THE NANO WITH NEW PIN ASSIGNMENTS.
-// Commit Date: March 10, 2020
+//VERSION 7:  NANO PIN ASSIGNMENTS, adds simple count up timer, LED dimmer, shows GPS PPS status.
+// Commit Date: 23-June-2020
 // RTC always has UTC time and date
 
-//Nano pins: D10-D13, SPI for Max;  A4(SDA) and A5(SCL) for I2C to DS3231 RTC; D0-D1 for serial.
-//           D2 for IR receiver interrupt. D4 for RTC-SQW. D5 for GPS-PPS.
+//Nano pins: D10-D13, SPI for Max;  A3/D17(SQW), A4(SDA) and A5(SCL) for I2C to DS3231 RTC.
+//           D0,D1(serial) D2(PPS) for GPS. D3 for IR receiver interrupt.
 
 //STATE MACHINE SETUP//
-  enum { DEBUG, BOOTUP, REG_OPS, TOGGLE_DISPLAY, GPS_INIT, GPS_PPS_SYNC, GPS_NMEA_SYNC} StateMachine;
+  enum { DEBUG, BOOTUP, REG_OPS, TOGGLE_DISPLAY, COUNTER, CHECK_PPS, GPS_INIT, GPS_PPS_SYNC, GPS_NMEA_SYNC} StateMachine;
 
 //PIN DEFS & ADDRESSES//
-  const byte RTC_SQW_Pin = 17;  //same as A3 pin (using analog pin as digital)
-  const byte GPS_PPS_Pin = 2;
+  const byte RTC_SQW_Pin = 17;  //same as A3 pin (using analog pin as digital for RTC SQW)
+  const byte GPS_PPS_Pin = 2;   // for receiving the GPS PPS signal
   const byte ir_pin = 3;    //Interrupt pin for IR receiver data pin.
   const byte ChipSelectPin = 10;  // For Max7219. We set the SPI Chip Select/Slave Select Pin here. 10 for uno/nano. 53 for mega
   
-  const int RTC_I2C_ADDRESS = 0x68;  // Must be type [int] to keep wire.h happy. Sets RTC DS3231 RTC i2C address. 
+  const int RTC_I2C_ADDRESS = 0x68;  // Must be data type [int] to keep wire.h happy. Sets RTC DS3231 i2C address. 
   
 
 //TIMERS AND EDGE DETECTORS//
@@ -34,7 +34,7 @@
   volatile byte pulseFlag = 0;
 
 
-//UTC offset handlers//
+//UTC offset handlers//  //ie, Time Zones and Daylight Savings (summer) Time //
   bool UTC_offset_enable = true; // False for UTC time. True for local time.
   
   const char offsetStandardHr = -5; 
@@ -42,15 +42,15 @@
   const char offsetDSTHr = -4; 
   const char offsetDSTMin = 0;
 
-  const byte startDST[4] = {2,0,3,2}; // {nth,day of week,month,hh} [0..6] for [Sunday...Saturday]
+  const byte startDST[4] = {2,0,3,2}; // {nth,day of week,month,hh} use [0..6] for [Sunday...Saturday]
   const byte startStandard[4] = {1,0,11,2}; // {nth,day of week,month,hh} [0..6] for [Sunday...Saturday]
                                  // set n=5 for 5th or last. Assume DST starts/stops at 2am local time
  
-  const byte days[] = {0,31,28,31,30,31,30,31,31,30,31,30,31}; // mapping days of the month
+  const byte days[] = {0,31,28,31,30,31,30,31,31,30,31,30,31}; // mapping days of the 12 months
 
   const int currentCentury = 2000;
   
-  /* globals that store our offset*/
+  /* globals that store our offset values*/
   int  offYYYY;
   byte offMO;
   byte offDD;
@@ -60,6 +60,7 @@
 
 //RTC date+time holders//
   byte ssRTC, mmRTC, hhRTC, dowRTC, ddRTC, moRTC, ctyRTC, yyRTC; 
+  byte countSS, countMM, countHH;
 
 //GPS UTC date+time handlers//
   byte hhGPS, mmGPS, ssGPS, ddGPS, moGPS;
@@ -80,11 +81,12 @@
 
 
 // SONY REMOTE CONTROL HANDLERS //
-unsigned int IR_start_bit = 2000;                 //Start bit threshold (Microseconds) 2408
-unsigned int IR_1 = 1000;                      //Binary 1 threshold (Microseconds) 1184-1240
-unsigned int IR_0 = 400;                       //Binary 0 threshold (Microseconds) 556-640
+unsigned int IR_start_bit = 2000;         //Start bit threshold (Microseconds) 2408
+unsigned int IR_1 = 1000;                 //Binary 1 threshold (Microseconds) 1184-1240
+unsigned int IR_0 = 400;                  //Binary 0 threshold (Microseconds) 556-640
 unsigned int IR_timeout = 2700;
 
+bool counter_enable = true;
 
 /* ----------------------- MAX STUFF ALL HERE ---------------------------vvvvvv
 ICSP BLOCK PINOUT
@@ -216,7 +218,7 @@ void initializeMax7219() {
     SPIwrite(reg_displaytest, 0x01); // 0x00 normal ops, 0x01 display test mode
     delay(100);
 
-    //exit test
+    //end the test
     SPIwrite(reg_displaytest, 0x00); // 0x00 normal ops, 0x01 display test mode
     delay(100);
 
@@ -248,19 +250,62 @@ void ISR_pulse_detected() {
 
 //**** SONY REMOTE ROUTINES  ****//
 
-void processSonyIR(int code) {
-
-  if (code == 0xCD15) {
+void processSonyIR(int code) {  // Sony IR code processors
+  
+  static byte brightness = 0x07;
+  
+  if (code == 0xCD15) {  // displays the date
     displayRTCDate();
     StateMachine = TOGGLE_DISPLAY;
     t1 = millis(); //sets t1 for date display in TOGGLE_DISPLAY state machine
   } //end if
 
-  if (code == 0xCD61) {
+  if (code == 0xCD61) {  // toggles UTC vs local time
     UTC_offset_enable = !UTC_offset_enable;
   } //end if
 
-  if (code == 0xCD10) {
+  if (code == 0xCD25) {  // Starts counter mode  
+    countSS = 0;  //we reset all the counter registers to 0
+    countMM = 0;
+    countHH = 0;
+    displayRTC_timeOnMax(countHH,countMM,countSS);
+    StateMachine = COUNTER;
+  } //end if
+
+  if (code == 0xCD52) {  // turns counter timer on and off
+    counter_enable = !counter_enable;
+  } //end if
+
+  if (code == 0xCD20) {  // Goes into REG_OPS (used to exit counter mode)
+    StateMachine = REG_OPS;
+  } //end if
+
+  if (code == 0xCD3D) {  // does a 4 second check displaying whether PPS signal is active
+    StateMachine = CHECK_PPS;
+    maxDisplay(P,P,S,blank,O,F,F,blank); // set this as default display. will be overwritten if PPS is active
+    t1 = millis(); //sets t1 for date display in CHECK_PPS state machine
+  } //end if
+
+  if (code == 0xCD76) {  // toggles through brightness levels
+    delay(160); // Sony IR transmits 3 signals w/ each button press. This delay avoids repeat commands here.    
+    switch (brightness) {
+      case 0x07: 
+        brightness = 0x0F;
+        break;
+      case 0x0F: 
+        brightness = 0x01;
+        break;
+      case 0x01: 
+        brightness = 0x07;
+        break;
+    } // end of switch
+    
+    SPIwrite(reg_intensity, brightness); // min 0x00, max 0x0F... 16 duty-cycle options. 0x07 middle.
+  
+  } //end if  
+
+
+  if (code == 0xCD10) {   // display status of local or UTC time
     if (UTC_offset_enable) {
       maxDisplay(L,O,C,A,L,blank,blank,blank);
     } //end if
@@ -272,7 +317,7 @@ void processSonyIR(int code) {
   } //end if
 } //end processSonyIR()
 
-void SonyIR_analyzer() {
+void SonyIR_analyzer() {  // see http://www.righto.com/2010/03/understanding-sony-ir-remote-codes-lirc.html
   static bool startFlag = false;
   static byte bitCount = 99; 
   static bool valid = false;
@@ -362,7 +407,7 @@ void displayRTC_timeOnMax(byte rtc_h, byte rtc_m, byte rtc_s) { //receiving [0-9
 
 //**** GPS HANDLERS **** //
 
-bool PPS_detect() {
+bool PPS_detect() {   // top of the second for ublox 6 GPS (default setting) is rising edge of PPS time pulse
     GPS_PPS_Prev = GPS_PPS_Current;
     GPS_PPS_Current = digitalRead(GPS_PPS_Pin);
     return (GPS_PPS_Prev == LOW && GPS_PPS_Current == HIGH); //returns true if PPS has gone high!
@@ -614,6 +659,32 @@ void displayRTCDate() {   // adjusts to local date if flag set
   }
 } //end displayRTCDate
 
+
+void countUp() {    
+
+  RTC_SQW_Prev = RTC_SQW_Current;
+  RTC_SQW_Current = digitalRead(RTC_SQW_Pin);
+  if (counter_enable && RTC_SQW_Prev == HIGH && RTC_SQW_Current == LOW) { //tests for falling edge
+    
+    countSS++;
+    
+    if (countSS == 60) {
+      countSS = 0;
+      countMM++;
+    } //end if
+    if (countMM == 60) {
+      countMM = 0;
+      countHH++;
+    } //end if
+    if (countHH == 100) {
+      countHH = 0;
+    }
+    
+    displayRTC_timeOnMax(countHH,countMM,countSS);
+    
+  } //end if 
+} //end of countUp
+
 void displayRTC() { //updates display if new RTC time. Detects DS3231 SQW falling edge then trigger display of time update
   
   RTC_SQW_Prev = RTC_SQW_Current;
@@ -704,9 +775,9 @@ void RunStateMachine() {
             sendRTC(0x02,temp_buffer ^ 0b01000000); //set BIT 6 low to enable 24 hr time
            } //end else
         } //end if
-
-   //StateMachine = DEBUG; // >>>> State Change! <<<<//
-    StateMachine = REG_OPS; // >>>> State Change! <<<<//
+   
+        //StateMachine = DEBUG; // >>>> State Change! <<<<//
+        StateMachine = REG_OPS; // >>>> State Change! <<<<//
         t0=micros();
         break;
      //end BOOTUP case
@@ -714,8 +785,10 @@ void RunStateMachine() {
  // ------------------------------    
         
     case REG_OPS:
+   
         displayRTC();  //keep the trains running
-        if (mmRTC == 15 && ssRTC == 0) {   //every hour at minute 5, do a GPS_INIT check to prep for GPS>RTC update
+        
+        if (mmRTC == 15 && ssRTC == 0) {  //every hour at minute 15, do a GPS_INIT check to prep for GPS-to-RTC time update
           GPS_INIT_t0 = millis(); //sets our timer to allow a timeout in the next state
           StateMachine = GPS_INIT; // >>>> State Change! <<<<//
           break;
@@ -732,6 +805,34 @@ void RunStateMachine() {
 
     case TOGGLE_DISPLAY:  //holds the display before resuming regular ops
         if (millis() - t1 < 3500) {
+           break;
+        }
+        else {
+           StateMachine = REG_OPS;
+           break;
+        }
+          
+        //end TOGGLE_DISPLAY case
+
+ // ------------------------------    
+
+    case COUNTER:  //runs the counter
+        countUp();
+        if (pulseFlag == 1) {
+          detachInterrupt(digitalPinToInterrupt(ir_pin)); //stop interrupt while we process
+          SonyIR_analyzer();
+          attachInterrupt(digitalPinToInterrupt(ir_pin), ISR_pulse_detected, CHANGE);
+        } // end if
+        break;
+          
+ // ------------------------------    
+
+    case CHECK_PPS:  //displays whether a PPS pulse is coming from GPS
+  
+        if (millis() - t1 < 4000) {
+           if (PPS_detect()) {
+              maxDisplay(P,P,S,blank,O,N,blank,blank);
+            }
            break;
         }
         else {
@@ -891,6 +992,7 @@ void setup() {
   attachInterrupt (digitalPinToInterrupt(ir_pin), ISR_pulse_detected, CHANGE); 
   
   StateMachine = BOOTUP;  //set the initial state
+
 }
 
 void loop() {
