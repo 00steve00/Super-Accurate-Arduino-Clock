@@ -1,4 +1,4 @@
-# Super-Accurate-Arduino-Clock
+# Super Accurate Arduino with GPS Clock
 An arduino based clock with 1ms accuracy over a year. Time stored in RTC continually updated by GPS module
 
 Project goal: Create a super-accurate (<1ms drift per year) standalone 7-segment LED clock whose time stays accurate and "sets itself" without access to the Internet or a host computer (i.e., without using NTP servers) by updating time via GPS time signals. Since GPS satellites have their own onboard atomic clocks, this is an extremely stable and accurate time source! The code only uses SPI.h and Wire.h comm libraries; everything else (interfacing with GPS module, Max7219, RTC DS3231, time calculations) is coded "manually" with NO OTHER additional libraries (as a challenge and learning experience). So the total code base ends up being quite light (about 7,300 bytes).
